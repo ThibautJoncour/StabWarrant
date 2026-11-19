@@ -423,8 +423,8 @@ app_ui = ui.page_fluid(
             width=330,
         ),
         ui.navset_tab(
-            ui.nav_panel("Pricer", ui.output_text_verbatim("results"), ui.h4("Yahoo Finance — IV ATM par échéance"), ui.output_plot("vol_chart"),
-                         ui.h4("IV Yahoo — composantes de l'interpolation ATM 1M"),
+            ui.nav_panel("Pricer", ui.output_text_verbatim("results"), ui.h4("IV ATM par échéance"), ui.output_plot("vol_chart"),
+                         ui.h4("Composantes de l'interpolation ATM 1M"),
                          ui.output_data_frame("iv_yahoo_table")),
             ui.nav_panel("Batch SG", ui.output_data_frame("greeks_batch")),
             ui.nav_panel(
