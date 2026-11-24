@@ -219,8 +219,8 @@ def compute_greeks(S0, lower, upper, sigma, r, T, notional=10, npaths=30000):
     gamma = (up - 2 * price + down) / hs**2
     hv = 0.01
     upv = dnt_mc(S0, lower, upper, sigma + hv, r, T, notional, npaths)[0]
-    downv = dnt_mc(S0, lower, upper, max(0.01, sigma - hv), r, T, notional, npaths)[0]
-    vega = (upv - downv) / (2 * hv) * 0.01  # 1 point de volatilité
+    downv = dnt_mc(S0, lower, upper, max(0.0, sigma - hv), r, T, notional, npaths)[0]
+    vega = (upv - downv) / (sigma + hv - max(0.0, sigma - hv)) * 0.01  # 1 point de volatilité
     nextday = dnt_mc(S0, lower, upper, sigma, r, max(T - 1/365, 1e-6), notional, npaths)[0]
     theta = nextday - price
     return price, surv, delta, gamma, vega, theta
@@ -383,7 +383,21 @@ app_ui = ui.page_fluid(
         ),
         ui.navset_tab(
             ui.nav_panel("Pricer", ui.output_text_verbatim("results"), ui.output_plot("vol_chart")),
-            ui.nav_panel("Batch SG", ui.output_data_frame("greeks_batch")),
+            ui.nav_panel("Batch SG",
+                ui.p("Gamma : €/USD² ; Vega signé : € par point d'IV."),
+                ui.output_data_frame("greeks_batch")),
+            ui.nav_panel("Scénarios Spot / IV",
+                ui.p("Repricing Monte Carlo de tous les Stability importés, à maturité restante constante. Référence : spot SG et IV de la barre latérale."),
+                ui.row(
+                    ui.column(6, ui.input_numeric("scenario_spot", "Spot NVIDIA scénario (USD)", 168, min=0.01, step=1)),
+                    ui.column(6, ui.input_slider("scenario_iv", "IV annuelle scénario (%)", min=1, max=200, value=50, step=1)),
+                ),
+                ui.input_action_button("scenario_run", "Repricer les Stability"),
+                ui.output_text("scenario_status"),
+                ui.output_data_frame("scenario_table"),
+                ui.output_plot("scenario_plot"),
+                ui.p("P&L théorique par titre, hors spread, frais et hedge. KO historique irréversible ; le spot seul ne permet pas de vérifier un KO passé. Gamma Monte Carlo potentiellement bruité."),
+            ),
             ui.nav_panel(
                 "Portefeuille",
                 ui.h4("Portefeuille Stability NVIDIA"),
@@ -580,6 +594,84 @@ def server(input, output, session):
     @render.data_frame
     def greeks_batch():
         return render.DataGrid(batch_data(), filters=True)
+
+    @reactive.calc
+    @reactive.event(input.scenario_run)
+    def scenario_data():
+        base = batch_data()
+        if base.empty or "Erreur" in base.columns:
+            return pd.DataFrame()
+        spot = float(input.scenario_spot())
+        sigma = float(input.scenario_iv()) / 100
+        if not np.isfinite(spot) or spot <= 0 or sigma <= 0:
+            return pd.DataFrame()
+        rate, nominal = input.rate(), input.notional()
+        npaths = min(int(input.npaths()), 30000)
+        rows = []
+        for _, row in base.iterrows():
+            lower, upper = float(row["Lower"]), float(row["Upper"])
+            T = (pd.Timestamp(row["Maturity"]).normalize() - pd.Timestamp.today().normalize()).days / 365
+            if T <= 0:
+                continue
+            ko = not lower < spot < upper
+            already_ko = not lower < float(row["Spot"]) < upper
+            if ko or already_ko:
+                price, surv, delta, gamma, vega, theta = (0.0,) * 6
+            else:
+                price, surv, delta, gamma, vega, theta = compute_greeks(
+                    spot, lower, upper, sigma, rate, T, nominal, npaths)
+            ref = float(row["Price"])
+            change = price - ref
+            ds = spot - float(row["Spot"])
+            dv = 100 * (sigma - float(input.sigma()))
+            approx = float(row["Delta"]) * ds + 0.5 * float(row["Gamma"]) * ds**2 + float(row["Vega"]) * dv
+            rows.append({
+                "Mnemo": row["Mnemo"], "Maturity": row["Maturity"],
+                "Lower": lower, "Upper": upper,
+                "Spot ref": row["Spot"], "Spot scenario": spot,
+                "IV ref %": 100 * float(input.sigma()), "IV scenario %": 100 * sigma,
+                "Prix ref": ref, "Prix scenario": price,
+                "PnL EUR": change, "PnL %": 100 * change / ref if ref > 0 else np.nan,
+                "PnL approx DGV": approx if not (ko or already_ko) else np.nan,
+                "Survie scenario %": 100 * surv,
+                "Delta ref": row["Delta"], "Delta scenario": delta,
+                "Gamma ref": row["Gamma"], "Gamma scenario": gamma,
+                "Vega ref": row["Vega"], "Vega scenario": vega,
+                "Theta scenario": theta,
+                "Statut": "KO (spot ref)" if already_ko else ("KO scenario" if ko else "Dans corridor"),
+            })
+        return pd.DataFrame(rows)
+
+    @output
+    @render.text
+    def scenario_status():
+        if input.sg_file() is None:
+            return "Importer un fichier Stability SG, puis cliquer sur Repricer."
+        if input.scenario_run() == 0:
+            return "Choisir le spot et l'IV, puis cliquer sur Repricer."
+        return "Relancer après toute modification des paramètres ou du fichier."
+
+    @output
+    @render.data_frame
+    def scenario_table():
+        return render.DataGrid(scenario_data().round(6), filters=True)
+
+    @output
+    @render.plot
+    def scenario_plot():
+        data = scenario_data()
+        fig, ax = plt.subplots(figsize=(9, 4))
+        if not data.empty:
+            labels = np.arange(len(data))
+            ax.bar(labels - 0.2, data["Prix ref"], width=0.4, label="Référence")
+            ax.bar(labels + 0.2, data["Prix scenario"], width=0.4, label="Scénario")
+            ax.set_xticks(labels)
+            ax.set_xticklabels(data["Mnemo"], rotation=45, ha="right")
+            ax.legend()
+        ax.set_ylabel("Prix théorique (€)")
+        ax.set_title("Impact combiné Spot / IV")
+        fig.tight_layout()
+        return fig
 
     @reactive.calc
     def portfolio_data():
