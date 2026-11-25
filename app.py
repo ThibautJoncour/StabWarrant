@@ -359,8 +359,66 @@ def portfolio_greeks(batch, positions):
     return pd.DataFrame(result, columns=cols), messages
 
 
+
+def yahoo_atm_term_structure():
+    """Spot-ATM call/put IV, interpolated in total variance across expiries."""
+    import yfinance as yf
+    ticker = yf.Ticker("NVDA")
+    history = ticker.history(period="5d", auto_adjust=False)
+    spot = float(history["Close"].dropna().iloc[-1])
+    if not np.isfinite(spot) or spot <= 0:
+        raise ValueError("Spot Yahoo indisponible")
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    expiries = sorted((pd.Timestamp(e).date() - today).days for e in ticker.options)
+    expiries = [d for d in expiries if d > 0]
+    targets = [30, 90, 180]
+    needed = set()
+    for target in targets:
+        below = [d for d in expiries if d <= target]
+        above = [d for d in expiries if d >= target]
+        if below and above:
+            needed.update([max(below), min(above)])
+    values = {}
+    for days in sorted(needed):
+        expiry = (pd.Timestamp(today) + pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+        try:
+            chain = ticker.option_chain(expiry)
+            legs = []
+            for frame in (chain.calls, chain.puts):
+                data = frame[["strike", "impliedVolatility"]].apply(pd.to_numeric, errors="coerce").dropna()
+                data = data[(data["impliedVolatility"] > 0.01) & (data["strike"] > 0)]
+                data = data.groupby("strike")["impliedVolatility"].median().sort_index()
+                if data.empty or spot < data.index[0] or spot > data.index[-1]:
+                    raise ValueError("ATM non encadré")
+                legs.append(float(np.interp(spot, data.index, data.values)))
+            values[days] = (legs[0] + legs[1]) / 2
+        except Exception:
+            continue
+    result = {}
+    for target in targets:
+        below = [d for d in values if d <= target]
+        above = [d for d in values if d >= target]
+        if not below or not above:
+            result[target] = None
+            continue
+        lo, hi = max(below), min(above)
+        if lo == hi:
+            result[target] = values[lo]
+        else:
+            w = (target - lo) / (hi - lo)
+            result[target] = float(np.sqrt(((1-w)*lo*values[lo]**2 + w*hi*values[hi]**2)/target))
+    return spot, result, datetime.now(timezone.utc)
+
+
 app_ui = ui.page_fluid(
     ui.h2("Stability / Double No Touch Pricer — NVIDIA"),
+    ui.card(
+        ui.card_header("NVIDIA — Volatilité implicite ATM (Yahoo Finance)"),
+        ui.output_ui("yahoo_iv_cards"),
+        ui.input_action_button("refresh_yahoo_iv", "Actualiser les IV"),
+        ui.p("IV annualisées, maturités constantes 30 / 90 / 180 jours. Données Yahoo potentiellement différées."),
+    ),
+
     ui.layout_sidebar(
         ui.sidebar(
             ui.input_numeric("spot", "Spot NVIDIA USD", 162.716),
@@ -460,6 +518,33 @@ app_ui = ui.page_fluid(
 
 
 def server(input, output, session):
+
+    @reactive.calc
+    @reactive.event(input.refresh_yahoo_iv, ignore_none=False)
+    def yahoo_iv_data():
+        try:
+            return yahoo_atm_term_structure(), None
+        except Exception as exc:
+            return None, str(exc)
+
+    @output
+    @render.ui
+    def yahoo_iv_cards():
+        data, error = yahoo_iv_data()
+        if error:
+            return ui.p("IV Yahoo indisponibles : " + error)
+        spot, values, fetched = data
+        return ui.TagList(
+            ui.row(*[
+                ui.column(4, ui.card(
+                    ui.card_header(f"IV ATM {months}M"),
+                    ui.h3(f"{values[days]:.2%}" if values[days] is not None else "N/D"),
+                )) for months, days in [(1, 30), (3, 90), (6, 180)]
+            ]),
+            ui.p(f"Spot de référence : {spot:.2f} USD | Récupération : {fetched:%Y-%m-%d %H:%M} UTC"),
+        )
+
+
     @output
     @render.download_button(filename="sg_stability_export.xlsx")
     def download_sg():
